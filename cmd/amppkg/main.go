@@ -37,6 +37,9 @@ import (
 	"github.com/ampproject/amppackager/packager/signer"
 	"github.com/ampproject/amppackager/packager/util"
 	"github.com/ampproject/amppackager/packager/validitymap"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 var flagConfig = flag.String("config", "amppkg.toml", "Path to the config toml file.")
@@ -45,6 +48,14 @@ var flagInvalidCert = flag.Bool("invalidcert", false, "True if invalid certifica
 
 // IMPORTANT: do not turn on this flag for now, it's still under development.
 var flagAutoRenewCert = flag.Bool("autorenewcert", false, "True if amppackager is to attempt cert auto-renewal.")
+
+var promCustomMetric = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "total_requests_by_code_and_url",
+		Help: "Total number of requests by HTTP code and URL.",
+	},
+	[]string{"code", "url"},
+)
 
 // Prints errors returned by pkg/errors with stack traces.
 func die(err interface{}) { log.Fatalf("%+v", err) }
@@ -59,6 +70,16 @@ func (this logIntercept) ServeHTTP(resp http.ResponseWriter, req *http.Request) 
 	this.handler.ServeHTTP(resp, req)
 	// TODO(twifkak): Get status code from resp. This requires making a ResponseWriter wrapper.
 	// TODO(twifkak): Separate the typical weblog from the detailed error log.
+}
+
+type promIntercept struct {
+	handler http.Handler
+}
+
+func (this promIntercept) ServeHTTP(resp http.ResponseWriter, req *http.Request) {
+	promhttp.InstrumentHandlerCounter(promCustomMetric.MustCurryWith(
+		prometheus.Labels{"url": req.URL.String()}),
+		this.handler).ServeHTTP(resp, req)
 }
 
 // Exposes an HTTP server. Don't run this on the open internet, for at least two reasons:
@@ -104,7 +125,7 @@ func main() {
 		} else {
 			die(errors.Wrap(err, "initializing cert cache"))
 		}
-        }
+	}
 
 	healthz, err := healthz.New(certCache)
 	if err != nil {
@@ -143,7 +164,8 @@ func main() {
 		Addr: addr,
 		// Don't use DefaultServeMux, per
 		// https://blog.cloudflare.com/exposing-go-on-the-internet/.
-		Handler:           logIntercept{mux.New(certCache, signer, validityMap, healthz)},
+		Handler: promIntercept{logIntercept{mux.New(certCache, signer, validityMap, healthz, promhttp.Handler())}},
+
 		ReadTimeout:       10 * time.Second,
 		ReadHeaderTimeout: 5 * time.Second,
 		// If needing to stream the response, disable WriteTimeout and
